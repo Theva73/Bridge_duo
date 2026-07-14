@@ -103,7 +103,7 @@ const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 const IS_IOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
 const BAR_COUNT = 24;
 
-let running=false, muted=false, micLang='zh', phase='idle', autoSpeak=true, faceToFace=false;
+let running=false, muted=false, micLang='zh', phase='idle', autoSpeak=true, faceToFace=false, lockedLang=null;
 let rec=null, restartT=null, watchdogT=null, speakT=null, meterT=null, wakeLock=null, lastActivity=Date.now();
 
 const $=id=>document.getElementById(id);
@@ -126,8 +126,11 @@ function setPhase(p){
   updatePills();
 }
 function updatePills(){
-  $('pillEn').className='pill en'+(running&&!muted&&micLang==='en'?' on':'');
-  $('pillZh').className='pill zh'+(running&&!muted&&micLang==='zh'?' on':'');
+  const pe=$('pillEn'), pz=$('pillZh');
+  pe.className='pill en'+(running&&!muted&&micLang==='en'?' on':'');
+  pz.className='pill zh'+(running&&!muted&&micLang==='zh'?' on':'');
+  pe.textContent = lockedLang==='en' ? '🔒 English → 中文' : '🎙 English';
+  pz.textContent = lockedLang==='zh' ? '🔒 中文 → English' : '🎙 中文';
   $('muteBtn').style.borderColor = micLang==='zh' ? '#B4451F' : '#1849C6';
 }
 
@@ -251,6 +254,19 @@ function liveInterim(t){
 }
 
 async function handleUtterance(text){
+  // LOCKED MODE: no guessing. Trust the locked language completely.
+  if(lockedLang){
+    const zhL = lockedLang==='zh';
+    const dL=addMsg(zhL?'zh':'en', text);
+    setPhase('translating');
+    let tL='';
+    try{ tL=await translate(text, zhL); setTrans(dL,tL, zhL?'en-US':'zh-CN'); }
+    catch(e){ setTrans(dL,'⚠ Translation failed — check internet', zhL?'en-US':'zh-CN'); }
+    const resumeL=()=>{ if(running&&!muted) restartT=setTimeout(()=>startRec(micLang), IS_IOS?280:150); else if(running) setPhase('muted'); };
+    if(autoSpeak&&tL){ setPhase('speaking'); say(tL, zhL?'en-US':'zh-CN', resumeL); }
+    else resumeL();
+    return;
+  }
   // Wrong-mic guard: heavy mix of Chinese + English chars means the recognizer
   // was set to the wrong language and mangled the speech. Don't translate garbage.
   const cjkN=(text.match(/[\u4e00-\u9fff]/g)||[]).length;
@@ -330,7 +346,16 @@ $('muteBtn').onclick=()=>{
     startRec(micLang);
   }
 };
-$('swapBtn').onclick=()=>{ micLang=micLang==='en'?'zh':'en'; updatePills(); if(running&&!muted) startRec(micLang); };
+$('swapBtn').onclick=()=>{ lockedLang=null; micLang=micLang==='en'?'zh':'en'; updatePills(); if(running&&!muted) startRec(micLang); };
+function toggleLock(lang){
+  lockedLang = lockedLang===lang ? null : lang;
+  if(lockedLang){ micLang=lockedLang; }
+  updatePills();
+  if(running&&!muted) startRec(micLang);
+}
+$('pillZh').onclick=()=>toggleLock('zh');
+$('pillEn').onclick=()=>toggleLock('en');
+$('pillZh').style.cursor='pointer'; $('pillEn').style.cursor='pointer';
 $('voiceChip').onclick=function(){ autoSpeak=!autoSpeak; this.classList.toggle('on',autoSpeak); this.textContent=autoSpeak?'🔊 Voice on':'🔇 Voice off'; };
 $('flipChip').onclick=function(){ faceToFace=!faceToFace; this.classList.toggle('on',faceToFace);
   document.querySelectorAll('.msg.zh').forEach(m=>m.classList.toggle('flip',faceToFace)); };
