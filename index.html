@@ -118,12 +118,13 @@ function setPhase(p){
   phase=p;
   const texts={
     idle:'Press ▶ Start — then just talk.',
+    starting:'Starting mic… speak after the beep',
     listening: micLang==='zh' ? '聆听中… 请说话 (listening for 中文)' : 'Listening… speak English',
     muted:'Mic muted · 麦克风已静音',
     translating:'Translating…',
     speaking:'Speaking translation…'
   };
-  setStatus(texts[p], p==='listening' ? (micLang==='zh'?'#B4451F':'#1849C6') : p==='muted'?'#9AA3B0':'#67707E');
+  setStatus(texts[p], p==='listening' ? (micLang==='zh'?'#B4451F':'#1849C6') : p==='starting'?'#B07A18' : p==='muted'?'#9AA3B0':'#67707E');
   updatePills();
 }
 function updatePills(){
@@ -199,6 +200,35 @@ function say(text, lang, done, queue){
   speakT=setTimeout(fin, est); // iOS never fires onend sometimes — never hang
 }
 
+// ---------- Audio session: warm mic, real level meter, ready beep ----------
+let audioCtx=null, warmStream=null, analyser=null, meterBuf=null, needBeep=false;
+function readyBeep(){
+  if(!needBeep||!audioCtx) return; needBeep=false;
+  try{
+    const o=audioCtx.createOscillator(), g=audioCtx.createGain();
+    o.frequency.value=880; g.gain.value=0.08;
+    o.connect(g); g.connect(audioCtx.destination);
+    o.start(); o.stop(audioCtx.currentTime+0.07);
+  }catch(e){}
+}
+async function warmMic(){
+  try{
+    if(!audioCtx) audioCtx=new (window.AudioContext||window.webkitAudioContext)();
+    if(audioCtx.state==='suspended') await audioCtx.resume();
+    if(!warmStream && navigator.mediaDevices && navigator.mediaDevices.getUserMedia){
+      warmStream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true}});
+      const src=audioCtx.createMediaStreamSource(warmStream);
+      analyser=audioCtx.createAnalyser(); analyser.fftSize=64;
+      src.connect(analyser);
+      meterBuf=new Uint8Array(analyser.frequencyBinCount);
+    }
+  }catch(e){ /* no warm stream — meter falls back to animation */ }
+}
+function releaseMic(){
+  try{ warmStream&&warmStream.getTracks().forEach(t=>t.stop()); }catch(e){}
+  warmStream=null; analyser=null;
+}
+
 // ---------- Recognition loop with watchdog ----------
 function startRec(lang){
   if(lockedLang){ startRecContinuous(lockedLang); return; }
@@ -207,19 +237,22 @@ function startRec(lang){
   const r=new SR();
   r.lang = lang==='en'?'en-US':'zh-CN';
   r.interimResults=true; r.continuous=false;
-  let finalText='', ended=false;
+  let finalText='', lastInterim='', ended=false;
   lastActivity=Date.now();
 
+  r.onstart=()=>{ if(running&&!muted){ lastActivity=Date.now(); setPhase('listening'); readyBeep(); } };
   r.onresult=e=>{
     lastActivity=Date.now();
     let s='';
     for(let i=e.resultIndex;i<e.results.length;i++){
-      if(e.results[i].isFinal) finalText+=e.results[i][0].transcript;
+      if(e.results[i].isFinal){ finalText+=e.results[i][0].transcript; lastInterim=''; }
       else s+=e.results[i][0].transcript;
     }
+    if(s) lastInterim=s;
     liveInterim(s||finalText);
   };
   r.onerror=e=>{
+    if(e.error==='audio-capture') releaseMic();
     if(e.error==='not-allowed'||e.error==='service-not-allowed'){
       showErr('Microphone blocked. iPhone Settings → Apps → Safari → Microphone → Allow. Then reload and press Start.');
       stopAll();
@@ -228,19 +261,20 @@ function startRec(lang){
   r.onend=()=>{
     ended=true; liveInterim('');
     if(!running||muted) return;
-    const t=finalText.trim();
+    // iOS often kills the session before marking words final — rescue the interim text
+    const t=(finalText.trim()||lastInterim.trim());
     if(t) handleUtterance(t);
-    else restartT=setTimeout(()=>startRec(micLang), IS_IOS?300:150);
+    else restartT=setTimeout(()=>startRec(micLang), IS_IOS?120:80);
   };
-  rec=r; setPhase('listening');
-  try{ r.start(); }catch(e){ restartT=setTimeout(()=>{try{r.start();}catch(e){}},700); }
+  rec=r; setPhase('starting');
+  try{ r.start(); }catch(e){ restartT=setTimeout(()=>{try{r.start();}catch(e){}},500); }
 
   clearTimeout(watchdogT);
   const watch=()=>{
     if(!running||muted||ended) return;
     if(Date.now()-lastActivity>25000){
       try{r.abort();}catch(e){}
-      if(running&&!muted) restartT=setTimeout(()=>startRec(micLang),600);
+      if(running&&!muted) restartT=setTimeout(()=>startRec(micLang),400);
     } else watchdogT=setTimeout(watch,5000);
   };
   watchdogT=setTimeout(watch,5000);
@@ -255,25 +289,28 @@ function startRecContinuous(lang){
   const r=new SR();
   r.lang = lang==='en'?'en-US':'zh-CN';
   r.interimResults=true; r.continuous=true;
-  let processed=0;
+  let processed=0, lastInterim='';
   lastActivity=Date.now();
 
+  r.onstart=()=>{ if(running&&!muted){ lastActivity=Date.now(); setPhase('listening'); readyBeep(); } };
   r.onresult=e=>{
     lastActivity=Date.now();
     let s='';
     for(let i=processed;i<e.results.length;i++){
       if(e.results[i].isFinal){
         const seg=e.results[i][0].transcript.trim();
-        processed=i+1;
+        processed=i+1; lastInterim='';
         // Echo guard (speaker mode only): skip segments captured while our own
         // voice plays. In earpiece mode audio is private — never skip.
         if(seg && (earpiece || !(autoSpeak && 'speechSynthesis' in window && speechSynthesis.speaking)))
           translateSegment(seg, lang);
       } else s+=e.results[i][0].transcript;
     }
+    if(s) lastInterim=s;
     liveInterim(s);
   };
   r.onerror=e=>{
+    if(e.error==='audio-capture') releaseMic();
     if(e.error==='not-allowed'||e.error==='service-not-allowed'){
       showErr('Microphone blocked. iPhone Settings → Apps → Safari → Microphone → Allow. Then reload and press Start.');
       stopAll();
@@ -281,11 +318,15 @@ function startRecContinuous(lang){
   };
   r.onend=()=>{
     liveInterim('');
-    // iOS ends continuous sessions periodically — restart immediately, seamlessly
-    if(running&&!muted&&lockedLang) restartT=setTimeout(()=>startRecContinuous(lockedLang), 250);
+    // iOS kills continuous sessions without finalizing — rescue the interim tail
+    const tail=lastInterim.trim(); lastInterim='';
+    if(tail && (earpiece || !(autoSpeak && 'speechSynthesis' in window && speechSynthesis.speaking)))
+      translateSegment(tail, lang);
+    // …then restart immediately, seamlessly
+    if(running&&!muted&&lockedLang) restartT=setTimeout(()=>startRecContinuous(lockedLang), 60);
   };
-  rec=r; setPhase('listening');
-  try{ r.start(); }catch(e){ restartT=setTimeout(()=>{try{r.start();}catch(e){}},700); }
+  rec=r; setPhase('starting');
+  try{ r.start(); }catch(e){ restartT=setTimeout(()=>{try{r.start();}catch(e){}},500); }
 
   clearTimeout(watchdogT);
   const watch=()=>{
@@ -317,49 +358,51 @@ function liveInterim(t){
 }
 
 async function handleUtterance(text){
-  // LOCKED MODE: no guessing. Trust the locked language completely.
-  if(lockedLang){
-    const zhL = lockedLang==='zh';
-    const dL=addMsg(zhL?'zh':'en', text);
-    setPhase('translating');
-    let tL='';
-    try{ tL=await translate(text, zhL); setTrans(dL,tL, zhL?'en-US':'zh-CN'); }
-    catch(e){ setTrans(dL,'⚠ Translation failed — check internet', zhL?'en-US':'zh-CN'); }
-    const resumeL=()=>{ if(running&&!muted) restartT=setTimeout(()=>startRec(micLang), IS_IOS?280:150); else if(running) setPhase('muted'); };
-    if(autoSpeak&&tL){ setPhase('speaking'); say(tL, zhL?'en-US':'zh-CN', resumeL); }
-    else resumeL();
-    return;
+  const zh = lockedLang ? lockedLang==='zh' : detectZh(text);
+  if(!lockedLang){
+    // Wrong-mic guard: heavy mix of Chinese + English chars means the recognizer
+    // was set to the wrong language and mangled the speech. Don't translate garbage.
+    const cjkN=(text.match(/[\u4e00-\u9fff]/g)||[]).length;
+    const ascN=(text.match(/[a-zA-Z]/g)||[]).length;
+    if(cjkN>1&&ascN>2&&Math.min(cjkN,ascN)/Math.max(cjkN,ascN)>0.2){
+      const d0=addMsg(micLang==='zh'?'zh':'en', text);
+      setTrans(d0,'❓ Mixed capture — mic was set to the wrong language. Tap ⇄ and say it again. 请再说一遍','en-US');
+      if(running&&!muted) restartT=setTimeout(()=>startRec(micLang), IS_IOS?120:80);
+      return;
+    }
+    micLang = zh?'en':'zh';
+    updatePills();
   }
-  // Wrong-mic guard: heavy mix of Chinese + English chars means the recognizer
-  // was set to the wrong language and mangled the speech. Don't translate garbage.
-  const cjkN=(text.match(/[\u4e00-\u9fff]/g)||[]).length;
-  const ascN=(text.match(/[a-zA-Z]/g)||[]).length;
-  if(cjkN>1&&ascN>2&&Math.min(cjkN,ascN)/Math.max(cjkN,ascN)>0.2){
-    const d0=addMsg(micLang==='zh'?'zh':'en', text);
-    setTrans(d0,'❓ Mixed capture — mic was set to the wrong language. Tap ⇄ and say it again. 请再说一遍','en-US');
-    const resume0=()=>{ if(running&&!muted) restartT=setTimeout(()=>startRec(micLang), IS_IOS?280:150); };
-    resume0(); return;
-  }
-  const zh=detectZh(text);
   const d=addMsg(zh?'zh':'en', text);
-  setPhase('translating');
+  // Earpiece / voice-off: our audio can't leak back into the mic, so resume
+  // listening IMMEDIATELY and run translation + speech in parallel — no deaf gap.
+  const overlap = earpiece || !autoSpeak;
+  const resume=()=>{ if(running&&!muted) restartT=setTimeout(()=>startRec(micLang), IS_IOS?120:80); else if(running) setPhase('muted'); };
+  if(overlap) resume(); else setPhase('translating');
   let t='';
   try{ t=await translate(text, zh); setTrans(d,t, zh?'en-US':'zh-CN'); }
   catch(e){ setTrans(d,'⚠ Translation failed — check internet', zh?'en-US':'zh-CN'); }
-  micLang = zh?'en':'zh';
-  updatePills();
-  const resume=()=>{ if(running&&!muted) restartT=setTimeout(()=>startRec(micLang), IS_IOS?280:150); else if(running) setPhase('muted'); };
-  if(autoSpeak&&t){ setPhase('speaking'); say(t, zh?'en-US':'zh-CN', resume); }
-  else resume();
+  if(autoSpeak&&t){
+    if(overlap){ say(t, zh?'en-US':'zh-CN', ()=>{}, true); }
+    else { setPhase('speaking'); say(t, zh?'en-US':'zh-CN', resume); }
+  } else if(!overlap) resume();
 }
 
 // ---------- Meter (activity-based; no second mic stream on iOS) ----------
 function startMeter(){
   clearInterval(meterT);
   meterT=setInterval(()=>{
+    const active = running&&!muted&&phase==='listening';
+    let level=null;
+    if(active&&analyser){
+      analyser.getByteFrequencyData(meterBuf);
+      let sum=0; for(let i=0;i<meterBuf.length;i++) sum+=meterBuf[i];
+      level=sum/meterBuf.length/255;
+    }
     bars.forEach(b=>{
-      const active = running&&!muted&&phase==='listening';
-      b.style.height=(active?2+Math.round(Math.random()*16):2)+'px';
+      let h=2;
+      if(active) h = level!==null ? 2+Math.round(level*30*(0.5+Math.random())) : 2+Math.round(Math.random()*16);
+      b.style.height=h+'px';
       b.style.background = muted||!running ? '#D5DAE1' : (micLang==='zh'?'#B4451F':'#1849C6');
     });
   },120);
@@ -377,7 +420,8 @@ $('mainBtn').onclick=()=>{
   showErr('');
   if(!SR){ showErr('Voice needs Safari on iPhone. Open this page in Safari — or use ⌨️ typing, which works everywhere.'); return; }
   if('speechSynthesis' in window){ const u=new SpeechSynthesisUtterance(' '); u.volume=0; speechSynthesis.speak(u); }
-  running=true; muted=false; micLang='zh';
+  running=true; muted=false; micLang='zh'; needBeep=true;
+  warmMic();
   $('mainBtn').textContent='⏹'; $('mainBtn').classList.add('listening');
   $('muteBtn').disabled=false; $('swapBtn').disabled=false;
   grabWake(); startMeter(); startRec('zh');
@@ -388,6 +432,7 @@ function stopAll(){
   if(rec){ try{rec.abort();}catch(e){} rec=null; }
   if('speechSynthesis' in window) speechSynthesis.cancel();
   try{wakeLock&&wakeLock.release();}catch(e){} wakeLock=null;
+  releaseMic();
   $('mainBtn').textContent='▶'; $('mainBtn').classList.remove('listening');
   $('muteBtn').disabled=true; $('muteBtn').classList.remove('muted'); $('muteBtn').textContent='🎙️';
   $('swapBtn').disabled=true;
@@ -406,7 +451,7 @@ $('muteBtn').onclick=()=>{
   } else {
     $('muteBtn').classList.remove('muted'); $('muteBtn').textContent='🎙️';
     $('mainBtn').classList.add('listening');
-    startRec(micLang);
+    needBeep=true; startRec(micLang);
   }
 };
 $('swapBtn').onclick=()=>{ lockedLang=null; micLang=micLang==='en'?'zh':'en'; updatePills(); if(running&&!muted) startRec(micLang); };
@@ -430,7 +475,7 @@ $('typeInput').addEventListener('keydown',e=>{ if(e.key==='Enter') send(); });
 function send(){ const v=$('typeInput').value.trim(); if(v){ handleUtterance(v); $('typeInput').value=''; } }
 
 startMeter(); updatePills();
-if('speechSynthesis' in window) speechSynthesis.getVoices();
+if('speechSynthesis' in window){ speechSynthesis.getVoices(); if(speechSynthesis.addEventListener) speechSynthesis.addEventListener('voiceschanged',()=>speechSynthesis.getVoices()); }
 </script>
 </body>
 </html>
