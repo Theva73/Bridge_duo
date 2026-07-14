@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <meta name="apple-mobile-web-app-capable" content="yes">
-<title>Bridge 桥 — Live Translator</title>
+<title>Bridge 桥 — Live Translator · Local AI build</title>
 <style>
   * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
   body { font-family:'Avenir Next','Segoe UI','PingFang SC',sans-serif; background:#F2F4F7; color:#17202B;
@@ -12,7 +12,7 @@
   header { padding:14px 18px 10px; display:flex; justify-content:space-between; align-items:center; }
   h1 { font-size:20px; letter-spacing:-0.02em; } h1 span { color:#8892A0; font-weight:500; }
   .sub { font-size:12px; color:#67707E; }
-  .chips { display:flex; gap:8px; }
+  .chips { display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end; }
   .chip { font-size:12px; font-weight:600; padding:7px 10px; border-radius:999px; cursor:pointer;
           border:1.5px solid #CBD2DB; background:#fff; color:#4A5462; }
   .chip.on { background:#17202B; color:#fff; border-color:#17202B; }
@@ -54,6 +54,19 @@
                    font-size:16px; outline:none; }
   #typeRow button { border-radius:999px; border:none; padding:0 16px; font-weight:600; cursor:pointer; }
   #sendBtn { background:#17202B; color:#fff; }
+  #lwPanel { margin:0 18px 8px; padding:12px 14px; background:#fff; border:1.5px solid #CBD2DB;
+             border-radius:14px; font-size:13px; display:none; }
+  #lwPanel h3 { font-size:13px; margin-bottom:8px; }
+  #lwRow { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  #lwModel { flex:1; min-width:170px; padding:8px 10px; border-radius:10px; border:1.5px solid #CBD2DB;
+             font-size:14px; background:#fff; }
+  #lwLoad { border:none; border-radius:999px; padding:9px 16px; font-weight:600; background:#17202B;
+            color:#fff; cursor:pointer; }
+  #lwLoad:disabled { opacity:0.5; }
+  #lwBar { height:6px; background:#EDF0F4; border-radius:3px; margin-top:10px; overflow:hidden; display:none; }
+  #lwBar div { height:100%; width:0%; background:#1849C6; border-radius:3px; transition:width 0.2s; }
+  #lwNote { color:#67707E; margin-top:8px; line-height:1.5; }
+  #lwStats { font-size:11px; color:#8892A0; margin-top:-6px; margin-bottom:8px; min-height:14px; }
   @media (prefers-reduced-motion:reduce){ *{animation:none!important;} }
 </style>
 </head>
@@ -67,14 +80,28 @@
     <button class="chip on" id="voiceChip">🔊 Voice on</button>
     <button class="chip" id="earChip">🎧 Earpiece</button>
     <button class="chip" id="flipChip">⇄ Face-to-face</button>
+    <button class="chip" id="engChip">🍎 Apple engine</button>
   </div>
 </header>
 <div id="err"></div>
+<div id="lwPanel">
+  <h3>🧠 Local AI engine — Whisper running on this phone</h3>
+  <div id="lwRow">
+    <select id="lwModel">
+      <option value="onnx-community/whisper-base">Base · ~80 MB · balanced</option>
+      <option value="onnx-community/whisper-tiny">Tiny · ~40 MB · fastest, roughest 中文</option>
+      <option value="onnx-community/whisper-small">Small · ~250 MB · best 中文, slowest</option>
+    </select>
+    <button id="lwLoad">Load model</button>
+  </div>
+  <div id="lwBar"><div id="lwBarFill"></div></div>
+  <div id="lwNote">Downloads once, then stays cached on the phone. Speech recognition happens entirely on-device — only the translation step still uses the internet.</div>
+</div>
 <div id="log">
   <div class="empty" id="empty">
     <b>One tap, then hands-free.</b><br>
-    Chinese speech is transcribed and translated to English<br>
-    continuously, without needing another tap.<br>
+    Whoever talks — English or 中文 — gets detected,<br>
+    translated, and spoken out automatically.<br>
     <span style="font-size:13px">无需按键，直接说中文即可自动翻译。</span><br><br>
     <span style="font-size:12px">Keep the screen on while translating.</span>
   </div>
@@ -87,6 +114,7 @@
 <div id="panel">
   <div id="meter"></div>
   <div id="status">Press ▶ Start — then just talk.</div>
+  <div id="lwStats"></div>
   <div id="row">
     <button class="rbtn" id="kbBtn" title="Type instead">⌨️</button>
     <button class="rbtn" id="muteBtn" disabled title="Mute microphone">🎙️</button>
@@ -104,12 +132,8 @@ const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 const IS_IOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
 const BAR_COUNT = 24;
 
-let running=false, muted=false, micLang='zh', phase='idle', autoSpeak=true, faceToFace=false, lockedLang='zh', earpiece=false;
+let running=false, muted=false, micLang='zh', phase='idle', autoSpeak=true, faceToFace=false, lockedLang=null, earpiece=false;
 let rec=null, restartT=null, watchdogT=null, speakT=null, meterT=null, wakeLock=null, lastActivity=Date.now();
-let recognitionEpoch=0, translationSequence=0;
-const recentSegments=new Map();
-let segmentBuffer='', segmentLang='zh', segmentTimer=null, segmentFirstAt=0;
-const SEGMENT_PAUSE_MS=700, SEGMENT_MAX_WAIT_MS=1800;
 
 const $=id=>document.getElementById(id);
 const meter=$('meter');
@@ -140,36 +164,23 @@ function updatePills(){
   $('muteBtn').style.borderColor = micLang==='zh' ? '#B4451F' : '#1849C6';
 }
 
-// ---------- Translation: timeout + retry keeps one failed request from stalling the session ----------
-async function fetchJSON(url, timeout=7000){
-  const controller=new AbortController();
-  const timer=setTimeout(()=>controller.abort(), timeout);
-  try{
-    const r=await fetch(url,{signal:controller.signal, cache:'no-store'});
-    if(!r.ok) throw new Error('HTTP '+r.status);
-    return await r.json();
-  }finally{ clearTimeout(timer); }
-}
-async function translateOnce(text, srcZh){
+// ---------- Translation: fast engine first, MyMemory as backup ----------
+async function translate(text, srcZh){
   const sl = srcZh ? 'zh-CN' : 'en', tl = srcZh ? 'en' : 'zh-CN';
+  // Fast path (~0.3s): Google translate endpoint
   try{
-    const d=await fetchJSON('https://translate.googleapis.com/translate_a/single?client=gtx&sl='+sl+'&tl='+tl+'&dt=t&q='+encodeURIComponent(text));
+    const r = await fetch('https://translate.googleapis.com/translate_a/single?client=gtx&sl='+sl+'&tl='+tl+'&dt=t&q='+encodeURIComponent(text));
+    const d = await r.json();
     const out = (d[0]||[]).map(x=>x&&x[0]).join('');
     if(out) return out;
   }catch(e){}
+  // Backup: MyMemory
   const pair = srcZh ? 'zh-CN|en-GB' : 'en-GB|zh-CN';
-  const d=await fetchJSON('https://api.mymemory.translated.net/get?q='+encodeURIComponent(text)+'&langpair='+pair, 8500);
+  const r = await fetch('https://api.mymemory.translated.net/get?q='+encodeURIComponent(text)+'&langpair='+pair);
+  const d = await r.json();
   let out = d?.responseData?.translatedText || '';
   if(!out || /MYMEMORY WARNING|QUERY LENGTH/i.test(out)) throw new Error('limit');
   return out;
-}
-async function translate(text, srcZh){
-  let lastError;
-  for(const wait of [0,350,1000]){
-    if(wait) await new Promise(resolve=>setTimeout(resolve,wait));
-    try{return await translateOnce(text,srcZh);}catch(e){lastError=e;}
-  }
-  throw lastError||new Error('translation unavailable');
 }
 
 function detectZh(t){
@@ -246,18 +257,196 @@ function releaseMic(){
   warmStream=null; analyser=null;
 }
 
-// ---------- Recognition loop with watchdog ----------
-function restartRecognition(lang, delay=100){
-  clearTimeout(restartT);
-  if(!running||muted) return;
-  restartT=setTimeout(()=>{
-    if(running&&!muted) (lockedLang?startRecContinuous:startRec)(lockedLang||lang);
-  },delay);
+// ---------- Local Whisper engine (on-device, experimental) ----------
+let engine='apple';                    // 'apple' | 'local'
+let lwWorker=null, lwReady=false, lwLoading=false, lwBusy=0, lwSeq=0, lwDeviceUsed='';
+let lwCapNode=null, lwCapSrc=null, lwCapturing=false, lwWorkletLoaded=false;
+let lwChunks=[], lwLen=0, lwSpeech=false, lwSilentMs=0, lwPre=[], lwPreLen=0, lwNoise=0.006, lwSRate=48000;
+let lwTimes=[];
+const LW_DEVICE = navigator.gpu ? 'webgpu' : 'wasm';
+
+const LW_WORKER_SRC =
+"import { pipeline } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.4.0';\n"+
+"let asr=null;\n"+
+"async function load(model, device){\n"+
+"  return await pipeline('automatic-speech-recognition', model, {\n"+
+"    device: device,\n"+
+"    dtype: device==='webgpu' ? {encoder_model:'fp32', decoder_model_merged:'q4'} : 'q8',\n"+
+"    progress_callback: function(p){ if(p.status==='progress') self.postMessage({type:'progress', file:p.file, loaded:p.loaded||0, total:p.total||0}); }\n"+
+"  });\n"+
+"}\n"+
+"self.onmessage = async function(e){\n"+
+"  const m=e.data;\n"+
+"  if(m.type==='load'){\n"+
+"    try{ asr=await load(m.model, m.device); self.postMessage({type:'ready', device:m.device}); }\n"+
+"    catch(err){\n"+
+"      if(m.device==='webgpu'){\n"+
+"        try{ asr=await load(m.model,'wasm'); self.postMessage({type:'ready', device:'wasm'}); return; }catch(e2){}\n"+
+"      }\n"+
+"      self.postMessage({type:'fatal', message:String(err&&err.message||err)});\n"+
+"    }\n"+
+"  } else if(m.type==='transcribe'){\n"+
+"    const t0=Date.now();\n"+
+"    try{\n"+
+"      const opts={task:'transcribe'};\n"+
+"      if(m.language) opts.language=m.language;\n"+
+"      const out=await asr(m.audio, opts);\n"+
+"      self.postMessage({type:'result', id:m.id, text:((out&&out.text)||'').trim(), ms:Date.now()-t0, dur:m.dur});\n"+
+"    }catch(err){ self.postMessage({type:'result', id:m.id, text:'', err:String(err&&err.message||err), ms:Date.now()-t0, dur:m.dur}); }\n"+
+"  }\n"+
+"};\n";
+
+const LW_WORKLET_SRC =
+"class C extends AudioWorkletProcessor{constructor(){super();this.b=[];this.n=0;}"+
+"process(i){const c=i[0]&&i[0][0];if(c){this.b.push(c.slice(0));this.n+=c.length;"+
+"if(this.n>=2048){const o=new Float32Array(this.n);let x=0;for(const p of this.b){o.set(p,x);x+=p.length;}"+
+"this.port.postMessage(o,[o.buffer]);this.b=[];this.n=0;}}return true;}}"+
+"registerProcessor('lwcap',C);";
+
+function lwUpdateChip(){
+  const c=$('engChip');
+  c.classList.toggle('on', engine==='local');
+  c.textContent = engine==='local' ? (lwReady?'🧠 Local AI ✓':'🧠 Local AI') : '🍎 Apple engine';
 }
+function lwShowPanel(show){ $('lwPanel').style.display=show?'block':'none'; }
+
+function lwLoadModel(){
+  if(lwLoading||lwReady) return;
+  lwLoading=true;
+  const prog={};
+  $('lwLoad').disabled=true; $('lwLoad').textContent='Loading…';
+  $('lwBar').style.display='block';
+  try{
+    lwWorker=new Worker(URL.createObjectURL(new Blob([LW_WORKER_SRC],{type:'text/javascript'})),{type:'module'});
+  }catch(e){ lwFatal('this browser cannot run module workers.'); return; }
+  lwWorker.onerror=()=>{ if(!lwReady) lwFatal('engine failed to start (CDN unreachable or iOS too old).'); };
+  lwWorker.onmessage=e=>{
+    const m=e.data;
+    if(m.type==='progress'){
+      prog[m.file]=[m.loaded,m.total];
+      let l=0,t=0; for(const k in prog){ l+=prog[k][0]; t+=prog[k][1]; }
+      const pct=t?Math.min(100,Math.round(l/t*100)):0;
+      $('lwBarFill').style.width=pct+'%';
+      $('lwLoad').textContent='Loading '+pct+'%';
+    } else if(m.type==='ready'){
+      lwReady=true; lwLoading=false; lwDeviceUsed=m.device;
+      $('lwLoad').textContent='Loaded ✓'; $('lwBarFill').style.width='100%';
+      $('lwNote').textContent='Model ready — running on '+(m.device==='webgpu'?'the GPU (fast path)':'CPU/WASM (slow path — expect lag)')+'. Cached for next time.';
+      lwUpdateChip();
+      setTimeout(()=>lwShowPanel(false),1200);
+      if(running&&engine==='local'&&!muted) lwStartCapture();
+    } else if(m.type==='fatal'){ lwFatal(m.message); }
+    else if(m.type==='result'){ lwOnResult(m); }
+  };
+  lwWorker.postMessage({type:'load', model:$('lwModel').value, device:LW_DEVICE});
+}
+function lwFatal(msg){
+  lwLoading=false; lwReady=false;
+  try{ lwWorker&&lwWorker.terminate(); }catch(e){} lwWorker=null;
+  $('lwLoad').disabled=false; $('lwLoad').textContent='Load model';
+  $('lwBar').style.display='none'; $('lwBarFill').style.width='0%';
+  showErr('Local engine: '+msg+' Switched back to the Apple engine.');
+  engine='apple'; lwUpdateChip(); lwShowPanel(false);
+  if(running&&!muted) startRec(micLang);
+}
+
+async function lwStartCapture(){
+  if(lwCapturing||!lwReady) return;
+  await warmMic();
+  if(!warmStream){ showErr('Microphone unavailable — allow mic access, then press Start again.'); return; }
+  lwSRate=audioCtx.sampleRate;
+  lwChunks=[]; lwLen=0; lwSpeech=false; lwSilentMs=0; lwPre=[]; lwPreLen=0;
+  const src=audioCtx.createMediaStreamSource(warmStream);
+  let node=null;
+  try{
+    if(!lwWorkletLoaded){
+      await audioCtx.audioWorklet.addModule(URL.createObjectURL(new Blob([LW_WORKLET_SRC],{type:'text/javascript'})));
+      lwWorkletLoaded=true;
+    }
+    node=new AudioWorkletNode(audioCtx,'lwcap');
+    node.port.onmessage=e=>lwFeed(e.data);
+  }catch(e){
+    node=audioCtx.createScriptProcessor(2048,1,1);
+    node.onaudioprocess=ev=>lwFeed(ev.inputBuffer.getChannelData(0).slice(0));
+    node.connect(audioCtx.destination);
+  }
+  src.connect(node);
+  lwCapSrc=src; lwCapNode=node; lwCapturing=true;
+  setPhase('listening'); readyBeep();
+}
+function lwStopCapture(){
+  lwCapturing=false; lwSpeech=false; lwChunks=[]; lwLen=0; lwPre=[]; lwPreLen=0; lwSilentMs=0;
+  try{ lwCapSrc&&lwCapSrc.disconnect(); }catch(e){}
+  try{ lwCapNode&&lwCapNode.disconnect(); }catch(e){}
+  lwCapSrc=null; lwCapNode=null;
+  liveInterim('');
+}
+function lwFeed(f32){
+  if(!lwCapturing||muted||!running) return;
+  // Speaker mode: while our own translation is playing out loud, the mic hears it — ignore.
+  if(!earpiece && autoSpeak && ('speechSynthesis' in window) && speechSynthesis.speaking){
+    lwSpeech=false; lwChunks=[]; lwLen=0; lwSilentMs=0; return;
+  }
+  let sum=0; for(let i=0;i<f32.length;i++) sum+=f32[i]*f32[i];
+  const rms=Math.sqrt(sum/f32.length);
+  const blockMs=f32.length/lwSRate*1000;
+  if(!lwSpeech) lwNoise=Math.min(0.02, lwNoise*0.97+rms*0.03);   // adapt to room noise
+  const TH=Math.max(0.010, lwNoise*3);
+  if(rms>TH){
+    if(!lwSpeech){ lwSpeech=true; lwChunks=lwPre.slice(); lwLen=lwPreLen; liveInterim('🎤 hearing speech…'); }
+    lwSilentMs=0; lwChunks.push(f32); lwLen+=f32.length;
+  } else if(lwSpeech){
+    lwSilentMs+=blockMs; lwChunks.push(f32); lwLen+=f32.length;
+    if(lwSilentMs>700) lwEndSegment();
+  } else {
+    lwPre.push(f32); lwPreLen+=f32.length;
+    while(lwPreLen>lwSRate*0.35 && lwPre.length>1){ lwPreLen-=lwPre[0].length; lwPre.shift(); }
+  }
+  if(lwSpeech && lwLen>lwSRate*12) lwEndSegment();                // hard cap: 12 s per segment
+}
+function lwEndSegment(){
+  lwSpeech=false;
+  const total=lwLen, parts=lwChunks;
+  lwChunks=[]; lwLen=0; lwSilentMs=0;
+  const dur=total/lwSRate;
+  if(dur<0.4||!lwWorker){ liveInterim(''); return; }              // breath / click — skip
+  const joined=new Float32Array(total);
+  let o=0; for(const p of parts){ joined.set(p,o); o+=p.length; }
+  const audio=lwTo16k(joined, lwSRate);
+  const id=++lwSeq; lwBusy++;
+  liveInterim('⚙️ recognizing '+dur.toFixed(1)+'s'+(lwBusy>1?' · '+lwBusy+' in queue':'')+'…');
+  const language = lockedLang ? (lockedLang==='zh'?'chinese':'english') : null;
+  lwWorker.postMessage({type:'transcribe', id:id, audio:audio, dur:dur, language:language}, [audio.buffer]);
+}
+function lwTo16k(f32, sr){
+  if(sr===16000) return f32;
+  const ratio=sr/16000, n=Math.floor(f32.length/ratio), out=new Float32Array(n);
+  for(let i=0;i<n;i++){
+    const idx=i*ratio, lo=Math.floor(idx), hi=Math.min(lo+1,f32.length-1), fr=idx-lo;
+    out[i]=f32[lo]*(1-fr)+f32[hi]*fr;
+  }
+  return out;
+}
+// Whisper hallucinates stock phrases on near-silence — filter the known junk.
+const LW_JUNK=/^(thank(s| you)[.! ]*|you[.]?|okay[.]?|bye[.!]?|嗯+。?|啊+。?|谢谢(大家)?(观看|收看)?。?|请不吝点赞.*|字幕.*|订阅.*|amara\.org.*)$/i;
+function lwOnResult(m){
+  lwBusy=Math.max(0,lwBusy-1);
+  if(lwBusy===0) liveInterim('');
+  lwTimes.push({dur:m.dur, ms:m.ms}); if(lwTimes.length>12) lwTimes.shift();
+  const a=lwTimes.reduce((s,x)=>({dur:s.dur+x.dur, ms:s.ms+x.ms}),{dur:0,ms:0});
+  const rtf=a.dur>0 ? (a.ms/1000)/a.dur : 0;
+  $('lwStats').textContent='Local: '+m.dur.toFixed(1)+'s speech → '+(m.ms/1000).toFixed(1)+'s to recognize'+(m.err?' (error)':'')+' · session avg '+rtf.toFixed(2)+'× realtime';
+  if(m.err||!m.text) return;
+  const text=m.text.replace(/[\[(][^\])]*[\])]/g,'').trim();      // strip [Music]-style tags
+  if(!text||LW_JUNK.test(text)) return;
+  const zh = lockedLang ? lockedLang==='zh' : detectZh(text);
+  translateSegment(text, zh?'zh':'en');
+}
+
+// ---------- Recognition loop with watchdog ----------
 function startRec(lang){
   if(lockedLang){ startRecContinuous(lockedLang); return; }
   if(!SR||!running||muted) return;
-  const epoch=++recognitionEpoch;
   if(rec){ try{rec.abort();}catch(e){} rec=null; }
   const r=new SR();
   r.lang = lang==='en'?'en-US':'zh-CN';
@@ -265,7 +454,7 @@ function startRec(lang){
   let finalText='', lastInterim='', ended=false;
   lastActivity=Date.now();
 
-  r.onstart=()=>{ if(epoch===recognitionEpoch&&running&&!muted){ lastActivity=Date.now(); setPhase('listening'); readyBeep(); } };
+  r.onstart=()=>{ if(running&&!muted){ lastActivity=Date.now(); setPhase('listening'); readyBeep(); } };
   r.onresult=e=>{
     lastActivity=Date.now();
     let s='';
@@ -285,11 +474,11 @@ function startRec(lang){
   };
   r.onend=()=>{
     ended=true; liveInterim('');
-    if(epoch!==recognitionEpoch||!running||muted) return;
+    if(!running||muted) return;
     // iOS often kills the session before marking words final — rescue the interim text
     const t=(finalText.trim()||lastInterim.trim());
     if(t) handleUtterance(t);
-    else restartRecognition(micLang, IS_IOS?120:80);
+    else restartT=setTimeout(()=>startRec(micLang), IS_IOS?120:80);
   };
   rec=r; setPhase('starting');
   try{ r.start(); }catch(e){ restartT=setTimeout(()=>{try{r.start();}catch(e){}},500); }
@@ -299,7 +488,7 @@ function startRec(lang){
     if(!running||muted||ended) return;
     if(Date.now()-lastActivity>25000){
       try{r.abort();}catch(e){}
-      if(running&&!muted) restartRecognition(micLang,400);
+      if(running&&!muted) restartT=setTimeout(()=>startRec(micLang),400);
     } else watchdogT=setTimeout(watch,5000);
   };
   watchdogT=setTimeout(watch,5000);
@@ -310,7 +499,6 @@ let interimEl=null;
 // ---------- CONTINUOUS mode (locked language): mic never stops ----------
 function startRecContinuous(lang){
   if(!SR||!running||muted) return;
-  const epoch=++recognitionEpoch;
   if(rec){ try{rec.abort();}catch(e){} rec=null; }
   const r=new SR();
   r.lang = lang==='en'?'en-US':'zh-CN';
@@ -318,7 +506,7 @@ function startRecContinuous(lang){
   let processed=0, lastInterim='';
   lastActivity=Date.now();
 
-  r.onstart=()=>{ if(epoch===recognitionEpoch&&running&&!muted){ lastActivity=Date.now(); setPhase('listening'); readyBeep(); } };
+  r.onstart=()=>{ if(running&&!muted){ lastActivity=Date.now(); setPhase('listening'); readyBeep(); } };
   r.onresult=e=>{
     lastActivity=Date.now();
     let s='';
@@ -329,7 +517,7 @@ function startRecContinuous(lang){
         // Echo guard (speaker mode only): skip segments captured while our own
         // voice plays. In earpiece mode audio is private — never skip.
         if(seg && (earpiece || !(autoSpeak && 'speechSynthesis' in window && speechSynthesis.speaking)))
-          queueSegment(seg, lang);
+          translateSegment(seg, lang);
       } else s+=e.results[i][0].transcript;
     }
     if(s) lastInterim=s;
@@ -343,14 +531,13 @@ function startRecContinuous(lang){
     }
   };
   r.onend=()=>{
-    if(epoch!==recognitionEpoch) return;
     liveInterim('');
     // iOS kills continuous sessions without finalizing — rescue the interim tail
     const tail=lastInterim.trim(); lastInterim='';
     if(tail && (earpiece || !(autoSpeak && 'speechSynthesis' in window && speechSynthesis.speaking)))
-      queueSegment(tail, lang, true);
+      translateSegment(tail, lang);
     // …then restart immediately, seamlessly
-    if(running&&!muted&&lockedLang) restartRecognition(lockedLang, IS_IOS?140:80);
+    if(running&&!muted&&lockedLang) restartT=setTimeout(()=>startRecContinuous(lockedLang), 60);
   };
   rec=r; setPhase('starting');
   try{ r.start(); }catch(e){ restartT=setTimeout(()=>{try{r.start();}catch(e){}},500); }
@@ -360,53 +547,21 @@ function startRecContinuous(lang){
     if(!running||muted) return;
     if(Date.now()-lastActivity>30000){
       try{r.abort();}catch(e){}
-      if(running&&!muted&&lockedLang) restartRecognition(lockedLang,600);
+      if(running&&!muted&&lockedLang) restartT=setTimeout(()=>startRecContinuous(lockedLang),600);
     } else watchdogT=setTimeout(watch,5000);
   };
   watchdogT=setTimeout(watch,5000);
 }
 
-// SpeechRecognition often marks Chinese as final after only a few words. Combine
-// nearby final fragments for a natural English sentence, without pausing the mic.
-function queueSegment(text, lang, force=false){
-  text=text.replace(/\s+/g,' ').trim();
-  if(!text) return;
-  const now=Date.now();
-  if(segmentBuffer && segmentLang!==lang) flushSegment();
-  segmentLang=lang;
-  segmentBuffer += segmentBuffer ? (lang==='zh' ? '' : ' ') + text : text;
-  if(!segmentFirstAt) segmentFirstAt=now;
-  clearTimeout(segmentTimer);
-  const completed=/[。！？!?…]$/.test(text);
-  const wait=(force||completed) ? 0 : Math.max(0, Math.min(SEGMENT_PAUSE_MS, SEGMENT_MAX_WAIT_MS-(now-segmentFirstAt)));
-  segmentTimer=setTimeout(flushSegment,wait);
-}
-function flushSegment(){
-  clearTimeout(segmentTimer); segmentTimer=null;
-  const text=segmentBuffer.trim(), lang=segmentLang;
-  segmentBuffer=''; segmentFirstAt=0;
-  if(text) translateSegment(text,lang);
-}
-
 // Translate one segment WITHOUT touching the mic — runs in parallel with listening
 async function translateSegment(text, lang){
-  text=text.replace(/\s+/g,' ').trim();
-  if(!text) return;
-  // Safari may send the final phrase again when it restarts recognition.
-  const key=lang+'|'+text.toLowerCase(), now=Date.now();
-  for(const [k,time] of recentSegments) if(now-time>8000) recentSegments.delete(k);
-  if(recentSegments.has(key)) return;
-  recentSegments.set(key,now);
-  const sequence=++translationSequence;
   const zh = lang==='zh';
   const d=addMsg(zh?'zh':'en', text);
   try{
     const t=await translate(text, zh);
     setTrans(d,t, zh?'en-US':'zh-CN');
     if(autoSpeak&&t) say(t, zh?'en-US':'zh-CN', ()=>{}, true);
-  }catch(e){
-    setTrans(d,'⚠ Translation could not be completed. Listening continues.', zh?'en-US':'zh-CN');
-  }
+  }catch(e){ setTrans(d,'⚠ Translation failed — check internet', zh?'en-US':'zh-CN'); }
 }
 function liveInterim(t){
   if(t){
@@ -426,7 +581,7 @@ async function handleUtterance(text){
     if(cjkN>1&&ascN>2&&Math.min(cjkN,ascN)/Math.max(cjkN,ascN)>0.2){
       const d0=addMsg(micLang==='zh'?'zh':'en', text);
       setTrans(d0,'❓ Mixed capture — mic was set to the wrong language. Tap ⇄ and say it again. 请再说一遍','en-US');
-      if(running&&!muted) restartRecognition(micLang, IS_IOS?120:80);
+      if(running&&!muted) restartT=setTimeout(()=>startRec(micLang), IS_IOS?120:80);
       return;
     }
     micLang = zh?'en':'zh';
@@ -436,7 +591,7 @@ async function handleUtterance(text){
   // Earpiece / voice-off: our audio can't leak back into the mic, so resume
   // listening IMMEDIATELY and run translation + speech in parallel — no deaf gap.
   const overlap = earpiece || !autoSpeak;
-  const resume=()=>{ if(running&&!muted) restartRecognition(micLang, IS_IOS?120:80); else if(running) setPhase('muted'); };
+  const resume=()=>{ if(running&&!muted) restartT=setTimeout(()=>startRec(micLang), IS_IOS?120:80); else if(running) setPhase('muted'); };
   if(overlap) resume(); else setPhase('translating');
   let t='';
   try{ t=await translate(text, zh); setTrans(d,t, zh?'en-US':'zh-CN'); }
@@ -470,29 +625,38 @@ function startMeter(){
 // ---------- Wake lock ----------
 async function grabWake(){ try{ if('wakeLock' in navigator) wakeLock=await navigator.wakeLock.request('screen'); }catch(e){} }
 document.addEventListener('visibilitychange',()=>{
-  if(document.visibilityState==='visible'&&running&&!muted){ grabWake(); restartRecognition(micLang,400); }
+  if(document.visibilityState==='visible'&&running&&!muted){
+    grabWake();
+    if(engine==='local'){
+      if(audioCtx&&audioCtx.state==='suspended') audioCtx.resume();
+      if(lwReady&&!lwCapturing) lwStartCapture();
+    } else restartT=setTimeout(()=>startRec(micLang),400);
+  }
 });
 
 // ---------- Controls ----------
 $('mainBtn').onclick=()=>{
   if(running){ stopAll(); return; }
   showErr('');
-  if(!SR){ showErr('Voice needs Safari on iPhone. Open this page in Safari — or use ⌨️ typing, which works everywhere.'); return; }
+  if(!SR && engine!=='local'){ showErr('Voice needs Safari on iPhone. Open this page in Safari, switch to the 🧠 Local AI engine, or use ⌨️ typing.'); return; }
   if('speechSynthesis' in window){ const u=new SpeechSynthesisUtterance(' '); u.volume=0; speechSynthesis.speak(u); }
-  running=true; muted=false; micLang='zh'; lockedLang='zh'; needBeep=true;
+  running=true; muted=false; micLang='zh'; needBeep=true;
   warmMic();
   $('mainBtn').textContent='⏹'; $('mainBtn').classList.add('listening');
   $('muteBtn').disabled=false; $('swapBtn').disabled=false;
-  grabWake(); startMeter(); startRec('zh');
+  grabWake(); startMeter();
+  if(engine==='local'){
+    if(lwReady) lwStartCapture();
+    else { lwShowPanel(true); setStatus('Load the Local AI model below — or tap the 🧠 chip to switch back to Apple.','#B07A18'); }
+  } else startRec('zh');
 };
 function stopAll(){
   running=false; muted=false;
-  recognitionEpoch++;
   clearTimeout(restartT); clearTimeout(watchdogT); clearTimeout(speakT);
-  clearTimeout(segmentTimer); segmentTimer=null; segmentBuffer=''; segmentFirstAt=0;
   if(rec){ try{rec.abort();}catch(e){} rec=null; }
   if('speechSynthesis' in window) speechSynthesis.cancel();
   try{wakeLock&&wakeLock.release();}catch(e){} wakeLock=null;
+  lwStopCapture();
   releaseMic();
   $('mainBtn').textContent='▶'; $('mainBtn').classList.remove('listening');
   $('muteBtn').disabled=true; $('muteBtn').classList.remove('muted'); $('muteBtn').textContent='🎙️';
@@ -505,6 +669,7 @@ $('muteBtn').onclick=()=>{
   if(muted){
     clearTimeout(restartT); clearTimeout(watchdogT);
     if(rec){ try{rec.abort();}catch(e){} rec=null; }
+    lwStopCapture();
     liveInterim('');
     $('muteBtn').classList.add('muted'); $('muteBtn').textContent='🔇';
     $('mainBtn').classList.remove('listening');
@@ -512,15 +677,16 @@ $('muteBtn').onclick=()=>{
   } else {
     $('muteBtn').classList.remove('muted'); $('muteBtn').textContent='🎙️';
     $('mainBtn').classList.add('listening');
-    needBeep=true; (lockedLang?startRecContinuous:startRec)(lockedLang||micLang);
+    needBeep=true;
+    if(engine==='local') lwStartCapture(); else startRec(micLang);
   }
 };
-$('swapBtn').onclick=()=>{ lockedLang=null; micLang=micLang==='en'?'zh':'en'; updatePills(); if(running&&!muted) startRec(micLang); };
+$('swapBtn').onclick=()=>{ lockedLang=null; micLang=micLang==='en'?'zh':'en'; updatePills(); if(running&&!muted&&engine!=='local') startRec(micLang); };
 function toggleLock(lang){
   lockedLang = lockedLang===lang ? null : lang;
   if(lockedLang){ micLang=lockedLang; }
   updatePills();
-  if(running&&!muted) startRec(micLang);
+  if(running&&!muted&&engine!=='local') startRec(micLang);
 }
 $('pillZh').onclick=()=>toggleLock('zh');
 $('pillEn').onclick=()=>toggleLock('en');
@@ -535,6 +701,31 @@ $('sendBtn').onclick=send;
 $('typeInput').addEventListener('keydown',e=>{ if(e.key==='Enter') send(); });
 function send(){ const v=$('typeInput').value.trim(); if(v){ handleUtterance(v); $('typeInput').value=''; } }
 
+$('engChip').onclick=function(){
+  if(engine==='apple'){
+    engine='local'; lwUpdateChip();
+    if(!lwReady) lwShowPanel(true);
+    if(running){
+      clearTimeout(restartT); clearTimeout(watchdogT);
+      if(rec){ try{rec.abort();}catch(e){} rec=null; }
+      liveInterim('');
+      if(lwReady&&!muted) lwStartCapture();
+      else if(!lwReady) setStatus('Load the Local AI model below to continue.','#B07A18');
+    }
+  } else {
+    engine='apple'; lwUpdateChip(); lwShowPanel(false);
+    lwStopCapture(); $('lwStats').textContent='';
+    if(running&&!muted) startRec(micLang);
+  }
+  try{ localStorage.setItem('bridgeEngine',engine); }catch(e){}
+};
+$('lwLoad').onclick=lwLoadModel;
+$('lwModel').onchange=function(){ try{ localStorage.setItem('bridgeModel',this.value); }catch(e){} };
+try{
+  const sm=localStorage.getItem('bridgeModel'); if(sm) $('lwModel').value=sm;
+  if(localStorage.getItem('bridgeEngine')==='local') engine='local';
+}catch(e){}
+lwUpdateChip();
 startMeter(); updatePills();
 if('speechSynthesis' in window){ speechSynthesis.getVoices(); if(speechSynthesis.addEventListener) speechSynthesis.addEventListener('voiceschanged',()=>speechSynthesis.getVoices()); }
 </script>
