@@ -242,6 +242,16 @@ function liveInterim(t){
 }
 
 async function handleUtterance(text){
+  // Wrong-mic guard: heavy mix of Chinese + English chars means the recognizer
+  // was set to the wrong language and mangled the speech. Don't translate garbage.
+  const cjkN=(text.match(/[\u4e00-\u9fff]/g)||[]).length;
+  const ascN=(text.match(/[a-zA-Z]/g)||[]).length;
+  if(cjkN>1&&ascN>2&&Math.min(cjkN,ascN)/Math.max(cjkN,ascN)>0.2){
+    const d0=addMsg(micLang==='zh'?'zh':'en', text);
+    setTrans(d0,'❓ Mixed capture — mic was set to the wrong language. Tap ⇄ and say it again. 请再说一遍','en-US');
+    const resume0=()=>{ if(running&&!muted) restartT=setTimeout(()=>startRec(micLang), IS_IOS?450:200); };
+    resume0(); return;
+  }
   const zh=detectZh(text);
   const d=addMsg(zh?'zh':'en', text);
   setPhase('translating');
