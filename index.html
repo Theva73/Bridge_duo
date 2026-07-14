@@ -108,6 +108,8 @@ let running=false, muted=false, micLang='zh', phase='idle', autoSpeak=true, face
 let rec=null, restartT=null, watchdogT=null, speakT=null, meterT=null, wakeLock=null, lastActivity=Date.now();
 let recognitionEpoch=0, translationSequence=0;
 const recentSegments=new Map();
+let segmentBuffer='', segmentLang='zh', segmentTimer=null, segmentFirstAt=0;
+const SEGMENT_PAUSE_MS=700, SEGMENT_MAX_WAIT_MS=1800;
 
 const $=id=>document.getElementById(id);
 const meter=$('meter');
@@ -327,7 +329,7 @@ function startRecContinuous(lang){
         // Echo guard (speaker mode only): skip segments captured while our own
         // voice plays. In earpiece mode audio is private — never skip.
         if(seg && (earpiece || !(autoSpeak && 'speechSynthesis' in window && speechSynthesis.speaking)))
-          translateSegment(seg, lang);
+          queueSegment(seg, lang);
       } else s+=e.results[i][0].transcript;
     }
     if(s) lastInterim=s;
@@ -346,7 +348,7 @@ function startRecContinuous(lang){
     // iOS kills continuous sessions without finalizing — rescue the interim tail
     const tail=lastInterim.trim(); lastInterim='';
     if(tail && (earpiece || !(autoSpeak && 'speechSynthesis' in window && speechSynthesis.speaking)))
-      translateSegment(tail, lang);
+      queueSegment(tail, lang, true);
     // …then restart immediately, seamlessly
     if(running&&!muted&&lockedLang) restartRecognition(lockedLang, IS_IOS?140:80);
   };
@@ -362,6 +364,28 @@ function startRecContinuous(lang){
     } else watchdogT=setTimeout(watch,5000);
   };
   watchdogT=setTimeout(watch,5000);
+}
+
+// SpeechRecognition often marks Chinese as final after only a few words. Combine
+// nearby final fragments for a natural English sentence, without pausing the mic.
+function queueSegment(text, lang, force=false){
+  text=text.replace(/\s+/g,' ').trim();
+  if(!text) return;
+  const now=Date.now();
+  if(segmentBuffer && segmentLang!==lang) flushSegment();
+  segmentLang=lang;
+  segmentBuffer += segmentBuffer ? (lang==='zh' ? '' : ' ') + text : text;
+  if(!segmentFirstAt) segmentFirstAt=now;
+  clearTimeout(segmentTimer);
+  const completed=/[。！？!?…]$/.test(text);
+  const wait=(force||completed) ? 0 : Math.max(0, Math.min(SEGMENT_PAUSE_MS, SEGMENT_MAX_WAIT_MS-(now-segmentFirstAt)));
+  segmentTimer=setTimeout(flushSegment,wait);
+}
+function flushSegment(){
+  clearTimeout(segmentTimer); segmentTimer=null;
+  const text=segmentBuffer.trim(), lang=segmentLang;
+  segmentBuffer=''; segmentFirstAt=0;
+  if(text) translateSegment(text,lang);
 }
 
 // Translate one segment WITHOUT touching the mic — runs in parallel with listening
@@ -465,6 +489,7 @@ function stopAll(){
   running=false; muted=false;
   recognitionEpoch++;
   clearTimeout(restartT); clearTimeout(watchdogT); clearTimeout(speakT);
+  clearTimeout(segmentTimer); segmentTimer=null; segmentBuffer=''; segmentFirstAt=0;
   if(rec){ try{rec.abort();}catch(e){} rec=null; }
   if('speechSynthesis' in window) speechSynthesis.cancel();
   try{wakeLock&&wakeLock.release();}catch(e){} wakeLock=null;
