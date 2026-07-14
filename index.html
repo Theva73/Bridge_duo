@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Bridge 桥 — Live Translator</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  body { font-family:'Avenir Next','Segoe UI','PingFang SC',sans-serif; background:#F2F4F7; color:#17202B;
+         display:flex; flex-direction:column; height:100dvh; max-width:560px; margin:0 auto; }
+  header { padding:14px 18px 10px; display:flex; justify-content:space-between; align-items:center; }
+  h1 { font-size:20px; letter-spacing:-0.02em; } h1 span { color:#8892A0; font-weight:500; }
+  .sub { font-size:12px; color:#67707E; }
+  .chips { display:flex; gap:8px; }
+  .chip { font-size:12px; font-weight:600; padding:7px 10px; border-radius:999px; cursor:pointer;
+          border:1.5px solid #CBD2DB; background:#fff; color:#4A5462; }
+  .chip.on { background:#17202B; color:#fff; border-color:#17202B; }
+  #err { margin:0 18px 8px; padding:10px 12px; background:#FDF0E7; border:1px solid #F0C9A8;
+         border-radius:10px; font-size:13px; display:none; }
+  #log { flex:1; overflow-y:auto; padding:6px 18px 12px; }
+  .empty { text-align:center; color:#8892A0; font-size:14px; margin-top:48px; line-height:1.8; }
+  .msg { margin:10px 0; padding:12px 14px; border-radius:14px; background:#fff;
+         box-shadow:0 1px 3px rgba(23,32,43,0.06); }
+  .msg.zh { border-left:4px solid #B4451F; } .msg.en { border-left:4px solid #1849C6; }
+  .msg.flip { transform:rotate(180deg); }
+  .tag { font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:0.06em; }
+  .msg.en .tag { color:#1849C6; } .msg.zh .tag { color:#B4451F; }
+  .orig { font-size:16px; margin:4px 0 6px; line-height:1.45; }
+  .trans { font-size:16px; line-height:1.45; font-weight:500; border-top:1px dashed #E3E7EC;
+           padding-top:6px; display:flex; align-items:center; gap:8px; }
+  .trans.pending { color:#98A1AE; font-weight:400; }
+  .spk { background:none; border:none; cursor:pointer; font-size:16px; padding:2px; }
+  .interim { opacity:0.7; font-style:italic; }
+  #panel { background:#fff; border-top:1px solid #E3E7EC; padding:14px 18px 26px; text-align:center; }
+  #meter { display:flex; align-items:flex-end; justify-content:center; gap:3px; height:32px; margin-bottom:8px; }
+  #meter div { width:4px; height:2px; border-radius:2px; background:#D5DAE1; transition:height 0.1s linear; }
+  #status { font-size:13px; font-weight:600; margin-bottom:12px; min-height:18px; color:#67707E; }
+  #row { display:flex; align-items:center; justify-content:center; gap:18px; }
+  .rbtn { border:none; border-radius:50%; cursor:pointer; display:flex; align-items:center;
+          justify-content:center; box-shadow:0 2px 8px rgba(23,32,43,0.15); font-size:20px; }
+  #kbBtn,#swapBtn { width:46px; height:46px; background:#F2F4F7; color:#4A5462; }
+  #muteBtn { width:60px; height:60px; background:#fff; border:2px solid #B4451F; font-size:24px; }
+  #muteBtn.muted { background:#9AA3B0; border:none; }
+  #muteBtn:disabled,#swapBtn:disabled { opacity:0.4; cursor:default; }
+  #mainBtn { width:84px; height:84px; background:#17202B; color:#fff; font-size:30px; }
+  #mainBtn.listening { animation:pulse 1.4s infinite; }
+  @keyframes pulse { 0%{box-shadow:0 0 0 0 rgba(23,32,43,0.35);} 70%{box-shadow:0 0 0 16px rgba(23,32,43,0);} 100%{box-shadow:0 0 0 0 rgba(23,32,43,0);} }
+  #pills { margin-top:12px; display:flex; justify-content:center; gap:6px; font-size:12px; }
+  .pill { padding:4px 10px; border-radius:999px; font-weight:600; background:#EDF0F4; color:#67707E; }
+  .pill.on.en { background:#1849C6; color:#fff; } .pill.on.zh { background:#B4451F; color:#fff; }
+  #typeRow { padding:10px 18px; background:#fff; border-top:1px solid #E3E7EC; display:none; gap:8px; }
+  #typeRow input { flex:1; padding:10px 12px; border-radius:10px; border:1.5px solid #17202B;
+                   font-size:16px; outline:none; }
+  #typeRow button { border-radius:999px; border:none; padding:0 16px; font-weight:600; cursor:pointer; }
+  #sendBtn { background:#17202B; color:#fff; }
+  @media (prefers-reduced-motion:reduce){ *{animation:none!important;} }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>Bridge <span>桥</span></h1>
+    <div class="sub">Hands-free interpreter · English ⇄ 中文</div>
+  </div>
+  <div class="chips">
+    <button class="chip on" id="voiceChip">🔊 Voice on</button>
+    <button class="chip" id="flipChip">⇄ Face-to-face</button>
+  </div>
+</header>
+<div id="err"></div>
+<div id="log">
+  <div class="empty" id="empty">
+    <b>One tap, then hands-free.</b><br>
+    Whoever talks — English or 中文 — gets detected,<br>
+    translated, and spoken out automatically.<br>
+    <span style="font-size:13px">无需按键，直接说中文即可自动翻译。</span><br><br>
+    <span style="font-size:12px">Keep the screen on while translating.</span>
+  </div>
+</div>
+<div id="typeRow">
+  <input id="typeInput" placeholder="Type in English or 输入中文 — auto-detected">
+  <button id="sendBtn">Send</button>
+  <button id="closeType" style="background:#EDF0F4">✕</button>
+</div>
+<div id="panel">
+  <div id="meter"></div>
+  <div id="status">Press ▶ Start — then just talk.</div>
+  <div id="row">
+    <button class="rbtn" id="kbBtn" title="Type instead">⌨️</button>
+    <button class="rbtn" id="muteBtn" disabled title="Mute microphone">🎙️</button>
+    <button class="rbtn" id="mainBtn">▶</button>
+    <button class="rbtn" id="swapBtn" disabled title="Swap language">⇄</button>
+  </div>
+  <div id="pills">
+    <span class="pill en" id="pillEn">🎙 English</span>
+    <span class="pill zh" id="pillZh">🎙 中文</span>
+  </div>
+</div>
+
+<script>
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+const IS_IOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
+const BAR_COUNT = 24;
+
+let running=false, muted=false, micLang='zh', phase='idle', autoSpeak=true, faceToFace=false;
+let rec=null, restartT=null, watchdogT=null, speakT=null, meterT=null, wakeLock=null, lastActivity=Date.now();
+
+const $=id=>document.getElementById(id);
+const meter=$('meter');
+for(let i=0;i<BAR_COUNT;i++) meter.appendChild(document.createElement('div'));
+const bars=[...meter.children];
+
+function setStatus(t,color){ $('status').textContent=t; $('status').style.color=color||'#67707E'; }
+function showErr(t){ const e=$('err'); e.textContent=t; e.style.display=t?'block':'none'; }
+function setPhase(p){
+  phase=p;
+  const texts={
+    idle:'Press ▶ Start — then just talk.',
+    listening: micLang==='zh' ? '聆听中… 请说话 (listening for 中文)' : 'Listening… speak English',
+    muted:'Mic muted · 麦克风已静音',
+    translating:'Translating…',
+    speaking:'Speaking translation…'
+  };
+  setStatus(texts[p], p==='listening' ? (micLang==='zh'?'#B4451F':'#1849C6') : p==='muted'?'#9AA3B0':'#67707E');
+  updatePills();
+}
+function updatePills(){
+  $('pillEn').className='pill en'+(running&&!muted&&micLang==='en'?' on':'');
+  $('pillZh').className='pill zh'+(running&&!muted&&micLang==='zh'?' on':'');
+  $('muteBtn').style.borderColor = micLang==='zh' ? '#B4451F' : '#1849C6';
+}
+
+// ---------- Translation (MyMemory — free, no key) ----------
+async function translate(text, srcZh){
+  const pair = srcZh ? 'zh-CN|en-GB' : 'en-GB|zh-CN';
+  const r = await fetch('https://api.mymemory.translated.net/get?q='+encodeURIComponent(text)+'&langpair='+pair);
+  const d = await r.json();
+  let out = d?.responseData?.translatedText || '';
+  if(!out || /MYMEMORY WARNING|QUERY LENGTH/i.test(out)) throw new Error('limit');
+  return out;
+}
+
+function detectZh(t){
+  const cjk=(t.match(/[\u4e00-\u9fff]/g)||[]).length;
+  const asc=(t.match(/[a-zA-Z]/g)||[]).length;
+  return cjk>asc;
+}
+
+// ---------- UI: messages ----------
+function addMsg(side, orig){
+  $('empty')&&$('empty').remove();
+  const d=document.createElement('div');
+  d.className='msg '+side+(faceToFace&&side==='zh'?' flip':'');
+  d.innerHTML='<div class="tag">'+(side==='zh'?'中文':'English')+'</div>'
+    +'<div class="orig"></div><div class="trans pending">Translating…</div>';
+  d.querySelector('.orig').textContent=orig;
+  $('log').appendChild(d);
+  $('log').scrollTop=$('log').scrollHeight;
+  return d;
+}
+function setTrans(d, t, lang){
+  const el=d.querySelector('.trans');
+  el.classList.remove('pending');
+  el.textContent='';
+  const span=document.createElement('span'); span.textContent=t; el.appendChild(span);
+  const b=document.createElement('button'); b.className='spk'; b.textContent='🔊';
+  b.onclick=()=>say(t,lang,()=>{});
+  el.appendChild(b);
+  $('log').scrollTop=$('log').scrollHeight;
+}
+
+// ---------- Speech out with anti-hang ----------
+function say(text, lang, done){
+  if(!('speechSynthesis' in window)){ done(); return; }
+  speechSynthesis.cancel();
+  const u=new SpeechSynthesisUtterance(text);
+  u.lang=lang;
+  const v=speechSynthesis.getVoices().find(v=>v.lang&&v.lang.startsWith(lang.split('-')[0]));
+  if(v) u.voice=v;
+  let fired=false;
+  const fin=()=>{ if(fired)return; fired=true; clearTimeout(speakT); done(); };
+  u.onend=fin; u.onerror=fin;
+  speechSynthesis.speak(u);
+  const est=Math.min(20000, 2000+text.length*(lang.startsWith('zh')?90:220));
+  speakT=setTimeout(fin, est); // iOS never fires onend sometimes — never hang
+}
+
+// ---------- Recognition loop with watchdog ----------
+function startRec(lang){
+  if(!SR||!running||muted) return;
+  if(rec){ try{rec.abort();}catch(e){} rec=null; }
+  const r=new SR();
+  r.lang = lang==='en'?'en-US':'zh-CN';
+  r.interimResults=true; r.continuous=false;
+  let finalText='', ended=false;
+  lastActivity=Date.now();
+
+  r.onresult=e=>{
+    lastActivity=Date.now();
+    let s='';
+    for(let i=e.resultIndex;i<e.results.length;i++){
+      if(e.results[i].isFinal) finalText+=e.results[i][0].transcript;
+      else s+=e.results[i][0].transcript;
+    }
+    liveInterim(s||finalText);
+  };
+  r.onerror=e=>{
+    if(e.error==='not-allowed'||e.error==='service-not-allowed'){
+      showErr('Microphone blocked. iPhone Settings → Apps → Safari → Microphone → Allow. Then reload and press Start.');
+      stopAll();
+    }
+  };
+  r.onend=()=>{
+    ended=true; liveInterim('');
+    if(!running||muted) return;
+    const t=finalText.trim();
+    if(t) handleUtterance(t);
+    else restartT=setTimeout(()=>startRec(micLang), IS_IOS?500:200);
+  };
+  rec=r; setPhase('listening');
+  try{ r.start(); }catch(e){ restartT=setTimeout(()=>{try{r.start();}catch(e){}},700); }
+
+  clearTimeout(watchdogT);
+  const watch=()=>{
+    if(!running||muted||ended) return;
+    if(Date.now()-lastActivity>25000){
+      try{r.abort();}catch(e){}
+      if(running&&!muted) restartT=setTimeout(()=>startRec(micLang),600);
+    } else watchdogT=setTimeout(watch,5000);
+  };
+  watchdogT=setTimeout(watch,5000);
+}
+
+let interimEl=null;
+function liveInterim(t){
+  if(t){
+    if(!interimEl){ interimEl=document.createElement('div'); interimEl.className='msg interim'; $('log').appendChild(interimEl); }
+    interimEl.textContent=t;
+    $('log').scrollTop=$('log').scrollHeight;
+  } else if(interimEl){ interimEl.remove(); interimEl=null; }
+}
+
+async function handleUtterance(text){
+  const zh=detectZh(text);
+  const d=addMsg(zh?'zh':'en', text);
+  setPhase('translating');
+  let t='';
+  try{ t=await translate(text, zh); setTrans(d,t, zh?'en-US':'zh-CN'); }
+  catch(e){ setTrans(d,'⚠ Translation failed — check internet', zh?'en-US':'zh-CN'); }
+  micLang = zh?'en':'zh';
+  updatePills();
+  const resume=()=>{ if(running&&!muted) restartT=setTimeout(()=>startRec(micLang), IS_IOS?450:200); else if(running) setPhase('muted'); };
+  if(autoSpeak&&t){ setPhase('speaking'); say(t, zh?'en-US':'zh-CN', resume); }
+  else resume();
+}
+
+// ---------- Meter (activity-based; no second mic stream on iOS) ----------
+function startMeter(){
+  clearInterval(meterT);
+  meterT=setInterval(()=>{
+    bars.forEach(b=>{
+      const active = running&&!muted&&phase==='listening';
+      b.style.height=(active?2+Math.round(Math.random()*16):2)+'px';
+      b.style.background = muted||!running ? '#D5DAE1' : (micLang==='zh'?'#B4451F':'#1849C6');
+    });
+  },120);
+}
+
+// ---------- Wake lock ----------
+async function grabWake(){ try{ if('wakeLock' in navigator) wakeLock=await navigator.wakeLock.request('screen'); }catch(e){} }
+document.addEventListener('visibilitychange',()=>{
+  if(document.visibilityState==='visible'&&running&&!muted){ grabWake(); restartT=setTimeout(()=>startRec(micLang),400); }
+});
+
+// ---------- Controls ----------
+$('mainBtn').onclick=()=>{
+  if(running){ stopAll(); return; }
+  showErr('');
+  if(!SR){ showErr('Voice needs Safari on iPhone. Open this page in Safari — or use ⌨️ typing, which works everywhere.'); return; }
+  if('speechSynthesis' in window){ const u=new SpeechSynthesisUtterance(' '); u.volume=0; speechSynthesis.speak(u); }
+  running=true; muted=false; micLang='zh';
+  $('mainBtn').textContent='⏹'; $('mainBtn').classList.add('listening');
+  $('muteBtn').disabled=false; $('swapBtn').disabled=false;
+  grabWake(); startMeter(); startRec('zh');
+};
+function stopAll(){
+  running=false; muted=false;
+  clearTimeout(restartT); clearTimeout(watchdogT); clearTimeout(speakT);
+  if(rec){ try{rec.abort();}catch(e){} rec=null; }
+  if('speechSynthesis' in window) speechSynthesis.cancel();
+  try{wakeLock&&wakeLock.release();}catch(e){} wakeLock=null;
+  $('mainBtn').textContent='▶'; $('mainBtn').classList.remove('listening');
+  $('muteBtn').disabled=true; $('muteBtn').classList.remove('muted'); $('muteBtn').textContent='🎙️';
+  $('swapBtn').disabled=true;
+  liveInterim(''); setPhase('idle');
+}
+$('muteBtn').onclick=()=>{
+  if(!running) return;
+  muted=!muted;
+  if(muted){
+    clearTimeout(restartT); clearTimeout(watchdogT);
+    if(rec){ try{rec.abort();}catch(e){} rec=null; }
+    liveInterim('');
+    $('muteBtn').classList.add('muted'); $('muteBtn').textContent='🔇';
+    $('mainBtn').classList.remove('listening');
+    setPhase('muted');
+  } else {
+    $('muteBtn').classList.remove('muted'); $('muteBtn').textContent='🎙️';
+    $('mainBtn').classList.add('listening');
+    startRec(micLang);
+  }
+};
+$('swapBtn').onclick=()=>{ micLang=micLang==='en'?'zh':'en'; updatePills(); if(running&&!muted) startRec(micLang); };
+$('voiceChip').onclick=function(){ autoSpeak=!autoSpeak; this.classList.toggle('on',autoSpeak); this.textContent=autoSpeak?'🔊 Voice on':'🔇 Voice off'; };
+$('flipChip').onclick=function(){ faceToFace=!faceToFace; this.classList.toggle('on',faceToFace);
+  document.querySelectorAll('.msg.zh').forEach(m=>m.classList.toggle('flip',faceToFace)); };
+$('kbBtn').onclick=()=>{ const t=$('typeRow'); t.style.display=t.style.display==='flex'?'none':'flex'; $('typeInput').focus(); };
+$('closeType').onclick=()=>$('typeRow').style.display='none';
+$('sendBtn').onclick=send;
+$('typeInput').addEventListener('keydown',e=>{ if(e.key==='Enter') send(); });
+function send(){ const v=$('typeInput').value.trim(); if(v){ handleUtterance(v); $('typeInput').value=''; } }
+
+startMeter(); updatePills();
+if('speechSynthesis' in window) speechSynthesis.getVoices();
+</script>
+</body>
+</html>
