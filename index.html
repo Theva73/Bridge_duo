@@ -45,6 +45,7 @@
   #muteBtn:disabled,#swapBtn:disabled { opacity:0.4; cursor:default; }
   #mainBtn { width:84px; height:84px; background:#17202B; color:#fff; font-size:30px; }
   #mainBtn.listening { animation:pulse 1.4s infinite; }
+  #mainBtn.ready { box-shadow:0 0 0 5px rgba(30,122,60,0.30); }
   @keyframes pulse { 0%{box-shadow:0 0 0 0 rgba(23,32,43,0.35);} 70%{box-shadow:0 0 0 16px rgba(23,32,43,0);} 100%{box-shadow:0 0 0 0 rgba(23,32,43,0);} }
   #pills { margin-top:12px; display:flex; justify-content:center; gap:6px; font-size:12px; }
   .pill { padding:4px 10px; border-radius:999px; font-weight:600; background:#EDF0F4; color:#67707E; }
@@ -90,7 +91,7 @@
     <select id="lwModel">
       <option value="onnx-community/whisper-base">Base · ~80 MB · balanced</option>
       <option value="onnx-community/whisper-tiny">Tiny · ~40 MB · fastest, roughest 中文</option>
-      <option value="onnx-community/whisper-small">Small · ~250 MB · best 中文, slowest</option>
+      <option value="onnx-community/whisper-small">Small · ~250 MB · best 中文 — may crash iPhone Safari</option>
     </select>
     <button id="lwLoad">Load model</button>
   </div>
@@ -262,8 +263,8 @@ let engine='apple';                    // 'apple' | 'local'
 let lwWorker=null, lwReady=false, lwLoading=false, lwBusy=0, lwSeq=0, lwDeviceUsed='';
 let lwCapNode=null, lwCapSrc=null, lwCapturing=false, lwWorkletLoaded=false;
 let lwChunks=[], lwLen=0, lwSpeech=false, lwSilentMs=0, lwPre=[], lwPreLen=0, lwNoise=0.006, lwSRate=48000;
-let lwTimes=[];
-const LW_DEVICE = navigator.gpu ? 'webgpu' : 'wasm';
+let lwTimes=[], lwPct=0;
+const LW_DEVICE = (navigator.gpu && !IS_IOS) ? 'webgpu' : 'wasm';   // iOS Safari WebGPU crashes tabs on big models — force WASM there
 
 const LW_WORKER_SRC =
 "import { pipeline } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.4.0';\n"+
@@ -309,10 +310,16 @@ function lwUpdateChip(){
   c.textContent = engine==='local' ? (lwReady?'🧠 Local AI ✓':'🧠 Local AI') : '🍎 Apple engine';
 }
 function lwShowPanel(show){ $('lwPanel').style.display=show?'block':'none'; }
+// Crash-loop guard: 'loading' is written before heavy work; only a surviving page
+// can overwrite it with 'ok'. If a fresh page load still sees 'loading', the last
+// attempt killed the tab — so we refuse to auto-load again.
+function lwBootMark(v){ try{ localStorage.setItem('lwBoot', v); }catch(e){} }
+function lwBootCheck(){ try{ return localStorage.getItem('lwBoot'); }catch(e){ return null; } }
 
 function lwLoadModel(){
   if(lwLoading||lwReady) return;
   lwLoading=true;
+  lwBootMark('loading');
   const prog={};
   $('lwLoad').disabled=true; $('lwLoad').textContent='Loading…';
   $('lwBar').style.display='block';
@@ -325,29 +332,42 @@ function lwLoadModel(){
     if(m.type==='progress'){
       prog[m.file]=[m.loaded,m.total];
       let l=0,t=0; for(const k in prog){ l+=prog[k][0]; t+=prog[k][1]; }
-      const pct=t?Math.min(100,Math.round(l/t*100)):0;
-      $('lwBarFill').style.width=pct+'%';
-      $('lwLoad').textContent='Loading '+pct+'%';
+      lwPct=t?Math.min(100,Math.round(l/t*100)):0;
+      $('lwBarFill').style.width=lwPct+'%';
+      $('lwLoad').textContent='Loading '+lwPct+'%';
+      updateReadiness();
     } else if(m.type==='ready'){
       lwReady=true; lwLoading=false; lwDeviceUsed=m.device;
+      lwBootMark('ok');
       $('lwLoad').textContent='Loaded ✓'; $('lwBarFill').style.width='100%';
       $('lwNote').textContent='Model ready — running on '+(m.device==='webgpu'?'the GPU (fast path)':'CPU/WASM (slow path — expect lag)')+'. Cached for next time.';
       lwUpdateChip();
       setTimeout(()=>lwShowPanel(false),1200);
       if(running&&engine==='local'&&!muted) lwStartCapture();
+      else updateReadiness();
     } else if(m.type==='fatal'){ lwFatal(m.message); }
     else if(m.type==='result'){ lwOnResult(m); }
   };
   lwWorker.postMessage({type:'load', model:$('lwModel').value, device:LW_DEVICE});
 }
+function lwReset(){
+  try{ lwWorker&&lwWorker.terminate(); }catch(e){} lwWorker=null;
+  lwReady=false; lwLoading=false; lwBusy=0; lwTimes=[]; lwPct=0;
+  lwStopCapture();
+  $('lwStats').textContent='';
+  $('lwLoad').disabled=false; $('lwLoad').textContent='Load model';
+  $('lwBar').style.display='none'; $('lwBarFill').style.width='0%';
+  lwUpdateChip();
+}
 function lwFatal(msg){
   lwLoading=false; lwReady=false;
+  lwBootMark('ok');
   try{ lwWorker&&lwWorker.terminate(); }catch(e){} lwWorker=null;
   $('lwLoad').disabled=false; $('lwLoad').textContent='Load model';
   $('lwBar').style.display='none'; $('lwBarFill').style.width='0%';
   showErr('Local engine: '+msg+' Switched back to the Apple engine.');
   engine='apple'; lwUpdateChip(); lwShowPanel(false);
-  if(running&&!muted) startRec(micLang);
+  if(running&&!muted) startRec(micLang); else updateReadiness();
 }
 
 async function lwStartCapture(){
@@ -442,6 +462,33 @@ function lwOnResult(m){
   const zh = lockedLang ? lockedLang==='zh' : detectZh(text);
   translateSegment(text, zh?'zh':'en');
 }
+
+// ---------- Preload & readiness: system warms up before ▶ is pressed ----------
+function updateReadiness(){
+  if(running) return;
+  $('mainBtn').classList.remove('ready');
+  if(engine==='local'){
+    if(lwLoading){ setStatus('Preparing local AI… '+lwPct+'%','#B07A18'); return; }
+    if(!lwReady){ setStatus('Local AI selected — model not loaded yet.','#B07A18'); return; }
+  }
+  if(engine==='apple' && !SR){
+    setStatus('No Apple voice engine in this browser — switch to 🧠 Local AI or use ⌨️.','#B4451F');
+    return;
+  }
+  if(warmStream){
+    setStatus('✅ Ready — press ▶ and talk right away.','#1E7A3C');
+    $('mainBtn').classList.add('ready');
+  } else {
+    setStatus('Press ▶ Start — first press connects the mic.','#67707E');
+  }
+}
+// Warm the mic + audio the moment the page opens (prompts once, then silent forever).
+(async()=>{ await warmMic(); updateReadiness(); })();
+// If iOS refused the early warm-up (needs a touch), any tap anywhere re-warms it.
+document.addEventListener('pointerdown', ()=>{
+  if(audioCtx&&audioCtx.state==='suspended') audioCtx.resume();
+  if(!warmStream&&!running) warmMic().then(updateReadiness);
+});
 
 // ---------- Recognition loop with watchdog ----------
 function startRec(lang){
@@ -642,12 +689,13 @@ $('mainBtn').onclick=()=>{
   if('speechSynthesis' in window){ const u=new SpeechSynthesisUtterance(' '); u.volume=0; speechSynthesis.speak(u); }
   running=true; muted=false; micLang='zh'; needBeep=true;
   warmMic();
-  $('mainBtn').textContent='⏹'; $('mainBtn').classList.add('listening');
+  $('mainBtn').textContent='⏹'; $('mainBtn').classList.remove('ready'); $('mainBtn').classList.add('listening');
   $('muteBtn').disabled=false; $('swapBtn').disabled=false;
   grabWake(); startMeter();
   if(engine==='local'){
     if(lwReady) lwStartCapture();
-    else { lwShowPanel(true); setStatus('Load the Local AI model below — or tap the 🧠 chip to switch back to Apple.','#B07A18'); }
+    else if(lwLoading) setStatus('Model still preparing ('+lwPct+'%) — listening starts the moment it finishes.','#B07A18');
+    else { lwShowPanel(true); lwLoadModel(); setStatus('Loading the local AI — listening starts the moment it finishes.','#B07A18'); }
   } else startRec('zh');
 };
 function stopAll(){
@@ -661,7 +709,7 @@ function stopAll(){
   $('mainBtn').textContent='▶'; $('mainBtn').classList.remove('listening');
   $('muteBtn').disabled=true; $('muteBtn').classList.remove('muted'); $('muteBtn').textContent='🎙️';
   $('swapBtn').disabled=true;
-  liveInterim(''); setPhase('idle');
+  liveInterim(''); setPhase('idle'); updateReadiness();
 }
 $('muteBtn').onclick=()=>{
   if(!running) return;
@@ -704,31 +752,44 @@ function send(){ const v=$('typeInput').value.trim(); if(v){ handleUtterance(v);
 $('engChip').onclick=function(){
   if(engine==='apple'){
     engine='local'; lwUpdateChip();
-    if(!lwReady) lwShowPanel(true);
+    if(!lwReady&&!lwLoading){ lwShowPanel(true); lwLoadModel(); }
     if(running){
       clearTimeout(restartT); clearTimeout(watchdogT);
       if(rec){ try{rec.abort();}catch(e){} rec=null; }
       liveInterim('');
       if(lwReady&&!muted) lwStartCapture();
-      else if(!lwReady) setStatus('Load the Local AI model below to continue.','#B07A18');
-    }
+      else if(!lwReady) setStatus('Loading the local AI ('+lwPct+'%) — listening starts when it finishes.','#B07A18');
+    } else updateReadiness();
   } else {
     engine='apple'; lwUpdateChip(); lwShowPanel(false);
     lwStopCapture(); $('lwStats').textContent='';
-    if(running&&!muted) startRec(micLang);
+    if(running&&!muted) startRec(micLang); else updateReadiness();
   }
   try{ localStorage.setItem('bridgeEngine',engine); }catch(e){}
 };
 $('lwLoad').onclick=lwLoadModel;
-$('lwModel').onchange=function(){ try{ localStorage.setItem('bridgeModel',this.value); }catch(e){} };
+$('lwModel').onchange=function(){
+  try{ localStorage.setItem('bridgeModel',this.value); }catch(e){}
+  if(lwReady||lwLoading){ lwReset(); if(engine==='local'){ lwShowPanel(true); lwLoadModel(); } }
+};
 try{
+  if(/[?&]engine=apple/.test(location.search)){
+    localStorage.setItem('bridgeEngine','apple'); localStorage.setItem('lwBoot','ok');
+  }
   const sm=localStorage.getItem('bridgeModel'); if(sm) $('lwModel').value=sm;
   if(localStorage.getItem('bridgeEngine')==='local') engine='local';
+  if(engine==='local' && lwBootCheck()==='loading'){
+    // Last page load died while the model was loading — break the crash loop.
+    engine='apple'; lwBootMark('ok');
+    localStorage.setItem('bridgeEngine','apple');
+    showErr('⚠️ The Local AI model crashed this tab on the last attempt, so it has been switched off. To retry, tap 🧠 and pick the Tiny model first.');
+  }
 }catch(e){}
 lwUpdateChip();
+if(engine==='local'&&!lwReady){ lwShowPanel(true); setTimeout(lwLoadModel, 800); }
+updateReadiness();
 startMeter(); updatePills();
 if('speechSynthesis' in window){ speechSynthesis.getVoices(); if(speechSynthesis.addEventListener) speechSynthesis.addEventListener('voiceschanged',()=>speechSynthesis.getVoices()); }
 </script>
 </body>
 </html>
-
