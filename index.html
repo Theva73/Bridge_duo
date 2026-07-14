@@ -65,6 +65,7 @@
   </div>
   <div class="chips">
     <button class="chip on" id="voiceChip">🔊 Voice on</button>
+    <button class="chip" id="earChip">🎧 Earpiece</button>
     <button class="chip" id="flipChip">⇄ Face-to-face</button>
   </div>
 </header>
@@ -103,7 +104,7 @@ const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 const IS_IOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
 const BAR_COUNT = 24;
 
-let running=false, muted=false, micLang='zh', phase='idle', autoSpeak=true, faceToFace=false, lockedLang=null;
+let running=false, muted=false, micLang='zh', phase='idle', autoSpeak=true, faceToFace=false, lockedLang=null, earpiece=false;
 let rec=null, restartT=null, watchdogT=null, speakT=null, meterT=null, wakeLock=null, lastActivity=Date.now();
 
 const $=id=>document.getElementById(id);
@@ -183,9 +184,9 @@ function setTrans(d, t, lang){
 }
 
 // ---------- Speech out with anti-hang ----------
-function say(text, lang, done){
+function say(text, lang, done, queue){
   if(!('speechSynthesis' in window)){ done(); return; }
-  speechSynthesis.cancel();
+  if(!queue) speechSynthesis.cancel();
   const u=new SpeechSynthesisUtterance(text);
   u.lang=lang;
   const v=speechSynthesis.getVoices().find(v=>v.lang&&v.lang.startsWith(lang.split('-')[0]));
@@ -200,6 +201,7 @@ function say(text, lang, done){
 
 // ---------- Recognition loop with watchdog ----------
 function startRec(lang){
+  if(lockedLang){ startRecContinuous(lockedLang); return; }
   if(!SR||!running||muted) return;
   if(rec){ try{rec.abort();}catch(e){} rec=null; }
   const r=new SR();
@@ -245,6 +247,67 @@ function startRec(lang){
 }
 
 let interimEl=null;
+
+// ---------- CONTINUOUS mode (locked language): mic never stops ----------
+function startRecContinuous(lang){
+  if(!SR||!running||muted) return;
+  if(rec){ try{rec.abort();}catch(e){} rec=null; }
+  const r=new SR();
+  r.lang = lang==='en'?'en-US':'zh-CN';
+  r.interimResults=true; r.continuous=true;
+  let processed=0;
+  lastActivity=Date.now();
+
+  r.onresult=e=>{
+    lastActivity=Date.now();
+    let s='';
+    for(let i=processed;i<e.results.length;i++){
+      if(e.results[i].isFinal){
+        const seg=e.results[i][0].transcript.trim();
+        processed=i+1;
+        // Echo guard (speaker mode only): skip segments captured while our own
+        // voice plays. In earpiece mode audio is private — never skip.
+        if(seg && (earpiece || !(autoSpeak && 'speechSynthesis' in window && speechSynthesis.speaking)))
+          translateSegment(seg, lang);
+      } else s+=e.results[i][0].transcript;
+    }
+    liveInterim(s);
+  };
+  r.onerror=e=>{
+    if(e.error==='not-allowed'||e.error==='service-not-allowed'){
+      showErr('Microphone blocked. iPhone Settings → Apps → Safari → Microphone → Allow. Then reload and press Start.');
+      stopAll();
+    }
+  };
+  r.onend=()=>{
+    liveInterim('');
+    // iOS ends continuous sessions periodically — restart immediately, seamlessly
+    if(running&&!muted&&lockedLang) restartT=setTimeout(()=>startRecContinuous(lockedLang), 250);
+  };
+  rec=r; setPhase('listening');
+  try{ r.start(); }catch(e){ restartT=setTimeout(()=>{try{r.start();}catch(e){}},700); }
+
+  clearTimeout(watchdogT);
+  const watch=()=>{
+    if(!running||muted) return;
+    if(Date.now()-lastActivity>30000){
+      try{r.abort();}catch(e){}
+      if(running&&!muted&&lockedLang) restartT=setTimeout(()=>startRecContinuous(lockedLang),600);
+    } else watchdogT=setTimeout(watch,5000);
+  };
+  watchdogT=setTimeout(watch,5000);
+}
+
+// Translate one segment WITHOUT touching the mic — runs in parallel with listening
+async function translateSegment(text, lang){
+  const zh = lang==='zh';
+  const d=addMsg(zh?'zh':'en', text);
+  try{
+    const t=await translate(text, zh);
+    setTrans(d,t, zh?'en-US':'zh-CN');
+    if(autoSpeak&&t) say(t, zh?'en-US':'zh-CN', ()=>{}, true);
+  }catch(e){ setTrans(d,'⚠ Translation failed — check internet', zh?'en-US':'zh-CN'); }
+}
 function liveInterim(t){
   if(t){
     if(!interimEl){ interimEl=document.createElement('div'); interimEl.className='msg interim'; $('log').appendChild(interimEl); }
@@ -357,6 +420,7 @@ $('pillZh').onclick=()=>toggleLock('zh');
 $('pillEn').onclick=()=>toggleLock('en');
 $('pillZh').style.cursor='pointer'; $('pillEn').style.cursor='pointer';
 $('voiceChip').onclick=function(){ autoSpeak=!autoSpeak; this.classList.toggle('on',autoSpeak); this.textContent=autoSpeak?'🔊 Voice on':'🔇 Voice off'; };
+$('earChip').onclick=function(){ earpiece=!earpiece; this.classList.toggle('on',earpiece); };
 $('flipChip').onclick=function(){ faceToFace=!faceToFace; this.classList.toggle('on',faceToFace);
   document.querySelectorAll('.msg.zh').forEach(m=>m.classList.toggle('flip',faceToFace)); };
 $('kbBtn').onclick=()=>{ const t=$('typeRow'); t.style.display=t.style.display==='flex'?'none':'flex'; $('typeInput').focus(); };
